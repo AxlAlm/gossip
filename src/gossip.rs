@@ -5,12 +5,240 @@ use serde_json;
 use serde_json::Error as SerdeError;
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
+use std::io::{self, empty};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::{thread, time};
 use tracing::{error, info, span, Level};
+
+pub struct Node {
+    id: String,
+    address: String,
+    shared_storage: Arc<Mutex<Storage>>,
+    shared_channel: Arc<Mutex<UdapChannel>>,
+    heartbeat_interval_secs: u64,
+    heartbeat_spread: usize,
+    poll_interval_milisecs: u64,
+}
+
+impl Node {
+    pub fn new(
+        id: String,
+        address: String,
+        shared_storage: Arc<Mutex<Storage>>,
+        heartbeat_interval_secs: u64,
+        heartbeat_spread: usize,
+        poll_interval_milisecs: u64,
+    ) -> Self {
+        let socket = UdpSocket::bind(&address).expect("Could not bind socket");
+        socket
+            .set_nonblocking(true)
+            .expect("Could not set socket to nonblocking");
+        let channel = UdapChannel { socket };
+
+        Node {
+            id,
+            address,
+            shared_storage,
+            shared_channel: Arc::new(Mutex::new(channel)),
+            heartbeat_interval_secs,
+            heartbeat_spread,
+            poll_interval_milisecs,
+        }
+    }
+
+    pub fn run(&self) -> Result<(), String> {
+        let node_span = span!(
+            Level::INFO,
+            "node",
+            node_id = &self.id,
+            address = &self.address,
+            thread = "main",
+        );
+        let _enter = node_span.enter();
+
+        info!("Running Node");
+        let poll_interval_milisecs = self.poll_interval_milisecs;
+        let heartbeat_interval_secs = self.heartbeat_interval_secs;
+        let heartbeat_spread = self.heartbeat_spread;
+        let id = self.id.clone();
+        let address = self.address.clone();
+        let shared_storage = self.shared_storage.clone();
+        let shared_channel = self.shared_channel.clone();
+        let shared_storage_clone = shared_storage.clone();
+        let shared_channel_clone = shared_channel.clone();
+
+        let span_clone = node_span.clone();
+        let _ = thread::spawn(move || {
+            let _enter = span_clone.enter();
+            periodic_heartbeat(
+                id,
+                address,
+                heartbeat_interval_secs,
+                heartbeat_spread,
+                shared_storage_clone,
+                shared_channel_clone,
+            )
+        });
+
+        let shared_storage_clone = shared_storage.clone();
+        let shared_channel_clone = shared_channel.clone();
+        let address = self.address.clone();
+        let span_clone = node_span.clone();
+        let _ = thread::spawn(move || {
+            let _enter = span_clone.enter();
+            gossip(
+                address,
+                poll_interval_milisecs,
+                heartbeat_spread,
+                shared_storage_clone,
+                shared_channel_clone,
+            )
+        });
+
+        Ok(())
+    }
+}
+
+fn periodic_heartbeat(
+    node_id: String,
+    address: String,
+    heartbeat_interval_secs: u64,
+    heartbeat_spread: usize,
+    shared_storage: Arc<Mutex<Storage>>,
+    shared_channel: Arc<Mutex<UdapChannel>>,
+) {
+    loop {
+        let heartbeat = Heartbeat {
+            id: node_id.clone(),
+            address: address.clone(),
+            timestamp: now_unix(),
+        };
+
+        let mut storage = match shared_storage.lock() {
+            Ok(guard) => guard,
+            Err(PoisonError { .. }) => {
+                error!("failed to lock shared storage");
+                continue;
+            }
+        };
+
+        match storage.insert(heartbeat.clone()) {
+            Ok(_) => (),
+            Err(e) => {
+                error!(error = e.to_string(), "failed insert heartbeat");
+                continue;
+            }
+        }
+
+        let addresses = match storage.select_n_random_addresses(
+            heartbeat_spread,
+            // we filter out address to node itself and node we got heartbeat from
+            vec![address.clone(), heartbeat.address.clone()],
+        ) {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                error!(error = e.to_string(), "failed to select n random addresses");
+                continue;
+            }
+        };
+
+        let channel = match shared_channel.lock() {
+            Ok(guard) => guard,
+            Err(PoisonError { .. }) => {
+                error!("failed to lock shared channel");
+                continue;
+            }
+        };
+
+        match channel.send(heartbeat.clone(), addresses.clone()) {
+            Ok(_) => {
+                info!("Heartbeat sent successfully");
+                // storage.sent_to(heartbeat.id.clone(), addresses.clone());
+                drop(storage);
+                drop(channel);
+                thread::sleep(Duration::from_secs(heartbeat_interval_secs))
+            }
+            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
+        };
+    }
+}
+
+fn gossip(
+    address: String,
+    poll_interval_milisecs: u64,
+    heartbeat_spread: usize,
+    shared_storage: Arc<Mutex<Storage>>,
+    shared_channel: Arc<Mutex<UdapChannel>>,
+) {
+    loop {
+        thread::sleep(Duration::from_millis(poll_interval_milisecs));
+
+        let channel = match shared_channel.lock() {
+            Ok(guard) => guard,
+            Err(PoisonError { .. }) => {
+                error!("failed to lock shared channel");
+                continue;
+            }
+        };
+
+        let heartbeat = match channel.receive() {
+            Ok(heartbeat) => heartbeat,
+            Err(HeartbeatError::WouldBlock) => continue,
+            Err(e) => {
+                error!(error = e.to_string(), "failed to receive heartbeat");
+                continue;
+            }
+        };
+
+        let mut storage = match shared_storage.lock() {
+            Ok(guard) => guard,
+            Err(PoisonError { .. }) => {
+                error!("failed to lock shared storage");
+                continue;
+            }
+        };
+
+        let n_times_received = match storage.insert(heartbeat.clone()) {
+            Ok(count) => count,
+            Err(e) => {
+                error!(error = e.to_string(), "failed to insert heartbeat");
+                continue;
+            }
+        };
+
+        if !should_forward(n_times_received) {
+            continue;
+        }
+
+        let mut b = vec![address.clone(), heartbeat.address.clone()];
+        // if storage.sent_to_data.get(&heartbeat.id).is_some() {
+        //     b.extend(storage.sent_to_data.get(&heartbeat.id).unwrap().clone())
+        // }
+
+        let addresses = match storage.select_n_random_addresses(
+            heartbeat_spread,
+            // we filter out address to node itself and node we got heartbeat from
+            b.clone(),
+        ) {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                error!(error = e.to_string(), "failed to select n random addresses");
+                continue;
+            }
+        };
+
+        dbg!(heartbeat.address.clone(), addresses.clone());
+
+        match channel.send(heartbeat.clone(), addresses.clone()) {
+            Ok(_) => (),
+            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
+        };
+
+        // storage.sent_to(heartbeat.id, addresses);
+    }
+}
 
 #[derive(Debug)]
 pub enum HeartbeatError {
@@ -59,86 +287,74 @@ impl From<String> for HeartbeatError {
 pub struct Heartbeat {
     id: String,
     address: String,
-    generation: u64,
-    version: u64,
-    timestamp: u64,
+    pub timestamp: u64,
 }
 
-impl Default for Heartbeat {
-    fn default() -> Self {
-        Heartbeat {
-            id: "".to_string(),
-            address: "".to_string(),
-            generation: 0,
-            version: 0,
-            timestamp: time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-}
-
+#[derive(Debug)]
 pub struct NodeHeartbeatData {
-    heartbeat: Heartbeat,
-    received_count: u64,
+    pub heartbeat: Heartbeat,
+    pub received_count: u64,
 }
 
+#[derive(Debug)]
 pub struct Storage {
-    node_address: String,
     pub data: HashMap<String, NodeHeartbeatData>,
+    pub sent_to_data: HashMap<String, Vec<String>>,
 }
 
 impl Storage {
-    fn select_n_random_addresses(&self, n: usize) -> Result<Vec<String>, HeartbeatError> {
+    fn select_n_random_addresses(
+        &self,
+        n: usize,
+        filter_out: Vec<String>,
+    ) -> Result<Vec<String>, HeartbeatError> {
         let addresses: Vec<String> = self
             .data
             .iter()
             .map(|(_, v)| v.heartbeat.address.clone())
-            .filter(|a| a != &self.node_address)
+            .filter(|a| !filter_out.contains(a))
             .collect();
         let selected_addresses = select_random_n_strings(addresses, n);
         return Ok(selected_addresses);
     }
 
     fn insert(&mut self, heartbeat: Heartbeat) -> Result<u64, HeartbeatError> {
-        if self.data.get(&heartbeat.id).is_none() {
-            self.data.insert(
-                heartbeat.id.clone(),
-                NodeHeartbeatData {
-                    heartbeat: heartbeat.clone(),
-                    received_count: 1,
-                },
-            );
-            return Ok(1);
+        let received_count = match self.data.get(&heartbeat.id) {
+            Some(d) => {
+                if heartbeat.timestamp > d.heartbeat.timestamp {
+                    // self.sent_to_data.insert(heartbeat.id.clone(), vec![]);
+                    1
+                } else {
+                    d.received_count + 1
+                }
+            }
+            None => 1,
         };
 
-        let heartbeat_data = self.data.get(&heartbeat.id).unwrap();
-        if heartbeat.generation > heartbeat_data.heartbeat.generation
-            || heartbeat.version > heartbeat_data.heartbeat.version
-        {
-            self.data.insert(
-                heartbeat.id.clone(),
-                NodeHeartbeatData {
-                    heartbeat: heartbeat.clone(),
-                    received_count: 1,
-                },
-            );
-            return Ok(1);
-        } else {
-            let x = self
-                .data
-                .insert(
-                    heartbeat.id.clone(),
-                    NodeHeartbeatData {
-                        heartbeat: heartbeat.clone(),
-                        received_count: heartbeat_data.received_count + 1,
-                    },
-                )
-                .unwrap();
-            return Ok(x.received_count);
-        }
+        let x = self.data.insert(
+            heartbeat.id.clone(),
+            NodeHeartbeatData {
+                heartbeat,
+                received_count,
+            },
+        );
+
+        dbg!(x);
+
+        Ok(received_count)
     }
+
+    // fn sent_to(&mut self, id: String, addresses: Vec<String>) {
+    //     // let mut x = addresses;
+    //     // if self.sent_to_data.get(&id).is_some() {
+    //     //     x.extend(self.sent_to_data.get(&id).unwrap().clone());
+    //     // }
+    //     self.sent_to_data.insert(id, addresses);
+    // }
+
+    // fn get_sent_to(&mut self, id: String, ) {
+    //     let z = self.sent_to_data.get(&id).unwrap();
+    // }
 }
 
 struct UdapChannel {
@@ -169,253 +385,41 @@ impl UdapChannel {
     }
 }
 
-pub struct Node {
-    id: String,
-    address: String,
-    generation: u64,
-    shared_storage: Arc<Mutex<Storage>>,
-    shared_channel: Arc<Mutex<UdapChannel>>,
-    heartbeat_interval_secs: u64,
-    heartbeat_spread: usize,
-    poll_interval_milisecs: u64,
-}
-
-impl Node {
-    pub fn new(
-        id: String,
-        address: String,
-        generation: u64,
-        shared_storage: Arc<Mutex<Storage>>,
-        heartbeat_interval_secs: u64,
-        heartbeat_spread: usize,
-        poll_interval_milisecs: u64,
-    ) -> Self {
-        let socket = UdpSocket::bind(&address).expect("Could not bind socket");
-        socket
-            .set_nonblocking(true)
-            .expect("Could not set socket to nonblocking");
-        let channel = UdapChannel { socket };
-
-        Node {
-            id,
-            address,
-            generation,
-            shared_storage,
-            shared_channel: Arc::new(Mutex::new(channel)),
-            heartbeat_interval_secs,
-            heartbeat_spread,
-            poll_interval_milisecs,
-        }
-    }
-
-    pub fn run(&self) -> Result<(), String> {
-        let node_span = span!(
-            Level::INFO,
-            "node",
-            node_id = &self.id,
-            address = &self.address,
-            thread = "main",
-        );
-        let _enter = node_span.enter();
-
-        info!("Running Node");
-        let poll_interval_milisecs = self.poll_interval_milisecs;
-        let heartbeat_interval_secs = self.heartbeat_interval_secs;
-        let heartbeat_spread = self.heartbeat_spread;
-        let id = self.id.clone();
-        let address = self.address.clone();
-        let generation = self.generation;
-        let shared_storage = self.shared_storage.clone();
-        let shared_channel = self.shared_channel.clone();
-        let shared_storage_clone = shared_storage.clone();
-        let shared_channel_clone = shared_channel.clone();
-
-        let span_clone = node_span.clone();
-        let _ = thread::spawn(move || {
-            let _enter = span_clone.enter();
-            span_clone.record("thread", "periodic gossip");
-            periodic_heartbeat(
-                id,
-                address,
-                generation,
-                heartbeat_interval_secs,
-                heartbeat_spread,
-                shared_storage_clone,
-                shared_channel_clone,
-            )
-        });
-
-        let shared_storage_clone = shared_storage.clone();
-        let shared_channel_clone = shared_channel.clone();
-        let span_clone = node_span.clone();
-        let _ = thread::spawn(move || {
-            let _enter = span_clone.enter();
-            span_clone.record("thread", "gossip");
-            gossip(
-                poll_interval_milisecs,
-                heartbeat_spread,
-                shared_storage_clone,
-                shared_channel_clone,
-            )
-        });
-
-        Ok(())
-    }
-}
-
-fn periodic_heartbeat(
-    node_id: String,
-    address: String,
-    generation: u64,
-    heartbeat_interval_secs: u64,
-    heartbeat_spread: usize,
-    shared_storage: Arc<Mutex<Storage>>,
-    shared_channel: Arc<Mutex<UdapChannel>>,
-) {
-    let mut version = 0;
-    loop {
-        version += 1;
-        let heartbeat = Heartbeat {
-            id: node_id.clone(),
-            address: address.clone(),
-            generation,
-            version,
-            timestamp: now_unix(),
-        };
-
-        let mut storage = match shared_storage.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared storage");
-                continue;
-            }
-        };
-
-        match storage.insert(heartbeat.clone()) {
-            Ok(_) => (),
-            Err(e) => {
-                error!(error = e.to_string(), "failed insert heartbeat");
-                continue;
-            }
-        }
-
-        let addresses = match storage.select_n_random_addresses(heartbeat_spread) {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to select n random addresses");
-                continue;
-            }
-        };
-
-        let channel = match shared_channel.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared channel");
-                continue;
-            }
-        };
-
-        match channel.send(heartbeat, addresses) {
-            Ok(_) => {
-                info!("Heartbeat sent successfully");
-                drop(storage);
-                drop(channel);
-                thread::sleep(Duration::from_secs(heartbeat_interval_secs))
-            }
-            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
-        };
-    }
-}
-
-fn gossip(
-    poll_interval_milisecs: u64,
-    heartbeat_spread: usize,
-    shared_storage: Arc<Mutex<Storage>>,
-    shared_channel: Arc<Mutex<UdapChannel>>,
-) {
-    loop {
-        thread::sleep(Duration::from_millis(poll_interval_milisecs));
-
-        let channel = match shared_channel.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared channel");
-                continue;
-            }
-        };
-
-        let heartbeat = match channel.receive() {
-            Ok(heartbeat) => heartbeat,
-            Err(HeartbeatError::WouldBlock) => continue,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to receive heartbeat");
-                continue;
-            }
-        };
-
-        let mut storage = match shared_storage.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared storage");
-                continue;
-            }
-        };
-
-        let n_times_received = storage.insert(heartbeat.clone());
-        if !should_forward(n_times_received.unwrap()) {
-            continue;
-        }
-
-        let addresses = match storage.select_n_random_addresses(heartbeat_spread) {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to select n random addresses");
-                continue;
-            }
-        };
-
-        match channel.send(heartbeat, addresses) {
-            Ok(_) => (),
-            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
-        };
-    }
-}
-
-pub fn setup_storage(id: String, address: String, seed_node_addresses: Vec<String>) -> Storage {
-    let mut table = HashMap::new();
+pub fn setup_storage(id: String, address: String, seed_nodes: Vec<(String, String)>) -> Storage {
+    let mut data = HashMap::new();
 
     // add seed nodes
-    for address in &seed_node_addresses {
-        table.insert(
+    for (id, address) in &seed_nodes {
+        data.insert(
             address.to_string(),
             NodeHeartbeatData {
                 received_count: 0,
                 heartbeat: Heartbeat {
+                    id: id.to_string(),
                     address: address.to_string(),
-                    ..Default::default()
+                    timestamp: now_unix(),
                 },
             },
         );
     }
 
     // add node itself
-    table.insert(
+    data.insert(
         id.to_string(),
         NodeHeartbeatData {
             heartbeat: Heartbeat {
                 id: id.to_string(),
                 address: address.to_string(),
-                ..Default::default()
+                timestamp: now_unix(),
             },
             received_count: 0,
         },
     );
 
     let storage = Storage {
-        node_address: address.clone(),
-        data: table,
+        data,
+        sent_to_data: HashMap::new(),
     };
-
     return storage;
 }
 
@@ -430,10 +434,16 @@ fn select_random_n_strings(a: Vec<String>, n: usize) -> Vec<String> {
     a[..n].to_vec()
 }
 
-fn should_forward(n_times_receieved: u64) -> bool {
-    let base_probability = 1.0;
-    let decay_factor = 0.3;
-    let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
+// fn should_forward(n_times_receieved: u64) -> bool {
+//     let base_probability = 1.0;
+//     let decay_factor = 0.3;
+//     let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
+//     let mut rng = rand::thread_rng();
+//     rng.gen::<f64>() < probability
+// }
+
+fn should_forward(n_times_received: u64) -> bool {
+    let probability = 1.0 / n_times_received as f64;
     let mut rng = rand::thread_rng();
     rng.gen::<f64>() < probability
 }

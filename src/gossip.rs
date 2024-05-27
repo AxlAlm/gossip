@@ -116,52 +116,66 @@ fn periodic_heartbeat(
             timestamp: now_unix(),
         };
 
-        let mut storage = match shared_storage.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared storage");
-                continue;
-            }
-        };
+        {
+            let mut storage = match shared_storage.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared storage");
+                    continue;
+                }
+            };
 
-        match storage.insert(heartbeat.clone()) {
-            Ok(_) => (),
-            Err(e) => {
-                error!(error = e.to_string(), "failed insert heartbeat");
-                continue;
+            match storage.insert(heartbeat.clone()) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!(error = e.to_string(), "failed insert heartbeat");
+                    continue;
+                }
             }
         }
 
-        let addresses = match storage.select_n_random_addresses(
-            heartbeat_spread,
-            // we filter out address to node itself and node we got heartbeat from
-            vec![address.clone(), heartbeat.address.clone()],
-        ) {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to select n random addresses");
-                continue;
-            }
-        };
+        let addresses;
+        {
+            let storage = match shared_storage.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared storage");
+                    continue;
+                }
+            };
 
-        let channel = match shared_channel.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared channel");
-                continue;
-            }
-        };
+            addresses = match storage.select_n_random_addresses(
+                heartbeat_spread,
+                // we filter out address to node itself and node we got heartbeat from
+                vec![address.clone(), heartbeat.address.clone()],
+            ) {
+                Ok(addresses) => addresses,
+                Err(e) => {
+                    error!(error = e.to_string(), "failed to select n random addresses");
+                    continue;
+                }
+            };
+        }
 
-        match channel.send(heartbeat.clone(), addresses.clone()) {
-            Ok(_) => {
-                info!("Heartbeat sent successfully");
-                // storage.sent_to(heartbeat.id.clone(), addresses.clone());
-                drop(storage);
-                drop(channel);
-                thread::sleep(Duration::from_secs(heartbeat_interval_secs))
-            }
-            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
-        };
+        {
+            let channel = match shared_channel.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared channel");
+                    continue;
+                }
+            };
+
+            match channel.send(heartbeat.clone(), addresses.clone()) {
+                Ok(_) => info!("Heartbeat sent successfully"),
+                Err(e) => {
+                    error!(error = e.to_string(), "failed to send heartbeat");
+                    continue;
+                }
+            };
+        }
+
+        thread::sleep(Duration::from_secs(heartbeat_interval_secs))
     }
 }
 
@@ -175,130 +189,88 @@ fn gossip(
     loop {
         thread::sleep(Duration::from_millis(poll_interval_milisecs));
 
-        let channel = match shared_channel.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared channel");
-                continue;
-            }
-        };
-        let heartbeat = match channel.receive() {
-            Ok(heartbeat) => heartbeat,
-            Err(HeartbeatError::WouldBlock) => continue,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to receive heartbeat");
-                continue;
-            }
-        };
-        drop(channel);
-
-        let mut storage = match shared_storage.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared storage");
-                continue;
-            }
+        let heartbeat: Heartbeat;
+        {
+            let channel = match shared_channel.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared channel");
+                    continue;
+                }
+            };
+            heartbeat = match channel.receive() {
+                Ok(heartbeat) => heartbeat,
+                Err(HeartbeatError::WouldBlock) => continue,
+                Err(e) => {
+                    error!(error = e.to_string(), "failed to receive heartbeat");
+                    continue;
+                }
+            };
         };
 
-        let n_times_received = match storage.insert(heartbeat.clone()) {
-            Ok(count) => count,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to insert heartbeat");
-                continue;
-            }
-        };
+        let n_times_received: u64;
+        {
+            let mut storage = match shared_storage.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared storage");
+                    continue;
+                }
+            };
 
-        // if address.clone() == "0.0.0.0:8013" {
-        //     dbg!(heartbeat.id.clone(), n_times_received)
-        // }
+            n_times_received = match storage.insert(heartbeat.clone()) {
+                Ok(count) => count,
+                Err(e) => {
+                    error!(error = e.to_string(), "failed to insert heartbeat");
+                    continue;
+                }
+            };
+        }
 
         if !should_forward(n_times_received) {
             continue;
         }
 
-        let mut b = vec![address.clone(), heartbeat.address.clone()];
-        // if storage.sent_to_data.get(&heartbeat.id).is_some() {
-        //     b.extend(storage.sent_to_data.get(&heartbeat.id).unwrap().clone())
-        // }
+        let addresses;
+        {
+            let storage = match shared_storage.lock() {
+                Ok(guard) => guard.clone(),
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared storage");
+                    continue;
+                }
+            };
 
-        let addresses = match storage.select_n_random_addresses(
-            heartbeat_spread,
-            // we filter out address to node itself and node we got heartbeat from
-            b.clone(),
-        ) {
-            Ok(addresses) => addresses,
-            Err(e) => {
-                error!(error = e.to_string(), "failed to select n random addresses");
-                continue;
-            }
-        };
-
-        // if address.clone() == "0.0.0.0:8013" {
-        //     dbg!(heartbeat.id.clone(), addresses.clone());
-        //     dbg!(storage.data.keys(), storage.data.keys().len());
-        // }
+            addresses = match storage.select_n_random_addresses(
+                heartbeat_spread,
+                // we filter out address to node itself and node we got heartbeat from
+                vec![address.clone(), heartbeat.address.clone()],
+            ) {
+                Ok(addresses) => addresses,
+                Err(e) => {
+                    error!(error = e.to_string(), "failed to select n random addresses");
+                    continue;
+                }
+            };
+        }
 
         if addresses.is_empty() {
             continue;
         }
 
-        let channel = match shared_channel.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared channel");
-                continue;
-            }
-        };
-        match channel.send(heartbeat.clone(), addresses.clone()) {
-            Ok(_) => (),
-            Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
-        };
-        drop(channel);
-
-        // storage.sent_to(heartbeat.id, addresses);
-    }
-}
-
-#[derive(Debug)]
-pub enum HeartbeatError {
-    Io(io::Error),
-    Serde(SerdeError),
-    WouldBlock,
-    Other(String),
-}
-
-impl fmt::Display for HeartbeatError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HeartbeatError::Io(err) => write!(f, "IO error: {}", err),
-            HeartbeatError::Serde(err) => write!(f, "Serialization error: {}", err),
-            HeartbeatError::WouldBlock => write!(f, "Operation would block"),
-            HeartbeatError::Other(err) => write!(f, "Other error: {}", err),
+        {
+            let channel = match shared_channel.lock() {
+                Ok(guard) => guard,
+                Err(PoisonError { .. }) => {
+                    error!("failed to lock shared channel");
+                    continue;
+                }
+            };
+            match channel.send(heartbeat.clone(), addresses.clone()) {
+                Ok(_) => (),
+                Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
+            };
         }
-    }
-}
-
-impl std::error::Error for HeartbeatError {}
-
-impl From<io::Error> for HeartbeatError {
-    fn from(err: io::Error) -> HeartbeatError {
-        if err.kind() == io::ErrorKind::WouldBlock {
-            HeartbeatError::WouldBlock
-        } else {
-            HeartbeatError::Io(err)
-        }
-    }
-}
-
-impl From<SerdeError> for HeartbeatError {
-    fn from(err: SerdeError) -> HeartbeatError {
-        HeartbeatError::Serde(err)
-    }
-}
-
-impl From<String> for HeartbeatError {
-    fn from(err: String) -> HeartbeatError {
-        HeartbeatError::Other(err)
     }
 }
 
@@ -309,13 +281,13 @@ pub struct Heartbeat {
     pub timestamp: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NodeHeartbeatData {
     pub heartbeat: Heartbeat,
     pub received_count: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Storage {
     pub data: HashMap<String, NodeHeartbeatData>,
     pub sent_to_data: HashMap<String, Vec<String>>,
@@ -360,18 +332,6 @@ impl Storage {
 
         Ok(received_count)
     }
-
-    fn sent_to(&mut self, id: String, addresses: Vec<String>) {
-        let mut x = addresses;
-        if self.sent_to_data.get(&id).is_some() {
-            x.extend(self.sent_to_data.get(&id).unwrap().clone());
-        }
-        self.sent_to_data.insert(id, x);
-    }
-
-    // fn get_sent_to(&mut self, id: String, ) {
-    //     let z = self.sent_to_data.get(&id).unwrap();
-    // }
 }
 
 struct UdapChannel {
@@ -480,4 +440,47 @@ pub fn now_unix() -> u64 {
         .duration_since(time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+}
+
+#[derive(Debug)]
+pub enum HeartbeatError {
+    Io(io::Error),
+    Serde(SerdeError),
+    WouldBlock,
+    Other(String),
+}
+
+impl fmt::Display for HeartbeatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeartbeatError::Io(err) => write!(f, "IO error: {}", err),
+            HeartbeatError::Serde(err) => write!(f, "Serialization error: {}", err),
+            HeartbeatError::WouldBlock => write!(f, "Operation would block"),
+            HeartbeatError::Other(err) => write!(f, "Other error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for HeartbeatError {}
+
+impl From<io::Error> for HeartbeatError {
+    fn from(err: io::Error) -> HeartbeatError {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            HeartbeatError::WouldBlock
+        } else {
+            HeartbeatError::Io(err)
+        }
+    }
+}
+
+impl From<SerdeError> for HeartbeatError {
+    fn from(err: SerdeError) -> HeartbeatError {
+        HeartbeatError::Serde(err)
+    }
+}
+
+impl From<String> for HeartbeatError {
+    fn from(err: String) -> HeartbeatError {
+        HeartbeatError::Other(err)
+    }
 }

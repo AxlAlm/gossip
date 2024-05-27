@@ -172,9 +172,13 @@ fn calculate_metrics(
 
         let mut nr_with_latest = 0;
         for (_, data) in &storage_snapshot.data {
-            n_messages_sent += data.received_count;
+            let seconds_since = gossip::now_unix() - data.heartbeat.timestamp.clone();
 
-            if gossip::now_unix() - data.heartbeat.timestamp.clone() < healthy_threshold_secs {
+            if seconds_since < HEARTBEAT_INTERVAL_SECS {
+                n_messages_sent += data.received_count;
+            }
+
+            if seconds_since < healthy_threshold_secs {
                 nr_with_latest += 1
             }
         }

@@ -5,7 +5,7 @@ use serde_json;
 use serde_json::Error as SerdeError;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{self, empty};
+use std::io::{self};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -182,7 +182,6 @@ fn gossip(
                 continue;
             }
         };
-
         let heartbeat = match channel.receive() {
             Ok(heartbeat) => heartbeat,
             Err(HeartbeatError::WouldBlock) => continue,
@@ -191,6 +190,7 @@ fn gossip(
                 continue;
             }
         };
+        drop(channel);
 
         let mut storage = match shared_storage.lock() {
             Ok(guard) => guard,
@@ -207,6 +207,10 @@ fn gossip(
                 continue;
             }
         };
+
+        // if address.clone() == "0.0.0.0:8013" {
+        //     dbg!(heartbeat.id.clone(), n_times_received)
+        // }
 
         if !should_forward(n_times_received) {
             continue;
@@ -229,12 +233,27 @@ fn gossip(
             }
         };
 
-        dbg!(heartbeat.address.clone(), addresses.clone());
+        // if address.clone() == "0.0.0.0:8013" {
+        //     dbg!(heartbeat.id.clone(), addresses.clone());
+        //     dbg!(storage.data.keys(), storage.data.keys().len());
+        // }
 
+        if addresses.is_empty() {
+            continue;
+        }
+
+        let channel = match shared_channel.lock() {
+            Ok(guard) => guard,
+            Err(PoisonError { .. }) => {
+                error!("failed to lock shared channel");
+                continue;
+            }
+        };
         match channel.send(heartbeat.clone(), addresses.clone()) {
             Ok(_) => (),
             Err(e) => error!(error = e.to_string(), "failed to send heartbeat"),
         };
+        drop(channel);
 
         // storage.sent_to(heartbeat.id, addresses);
     }
@@ -322,7 +341,7 @@ impl Storage {
         let received_count = match self.data.get(&heartbeat.id) {
             Some(d) => {
                 if heartbeat.timestamp > d.heartbeat.timestamp {
-                    // self.sent_to_data.insert(heartbeat.id.clone(), vec![]);
+                    self.sent_to_data.insert(heartbeat.id.clone(), vec![]);
                     1
                 } else {
                     d.received_count + 1
@@ -331,7 +350,7 @@ impl Storage {
             None => 1,
         };
 
-        let x = self.data.insert(
+        self.data.insert(
             heartbeat.id.clone(),
             NodeHeartbeatData {
                 heartbeat,
@@ -339,18 +358,16 @@ impl Storage {
             },
         );
 
-        dbg!(x);
-
         Ok(received_count)
     }
 
-    // fn sent_to(&mut self, id: String, addresses: Vec<String>) {
-    //     // let mut x = addresses;
-    //     // if self.sent_to_data.get(&id).is_some() {
-    //     //     x.extend(self.sent_to_data.get(&id).unwrap().clone());
-    //     // }
-    //     self.sent_to_data.insert(id, addresses);
-    // }
+    fn sent_to(&mut self, id: String, addresses: Vec<String>) {
+        let mut x = addresses;
+        if self.sent_to_data.get(&id).is_some() {
+            x.extend(self.sent_to_data.get(&id).unwrap().clone());
+        }
+        self.sent_to_data.insert(id, x);
+    }
 
     // fn get_sent_to(&mut self, id: String, ) {
     //     let z = self.sent_to_data.get(&id).unwrap();
@@ -391,7 +408,7 @@ pub fn setup_storage(id: String, address: String, seed_nodes: Vec<(String, Strin
     // add seed nodes
     for (id, address) in &seed_nodes {
         data.insert(
-            address.to_string(),
+            id.to_string(),
             NodeHeartbeatData {
                 received_count: 0,
                 heartbeat: Heartbeat {
@@ -434,21 +451,31 @@ fn select_random_n_strings(a: Vec<String>, n: usize) -> Vec<String> {
     a[..n].to_vec()
 }
 
-// fn should_forward(n_times_receieved: u64) -> bool {
-//     let base_probability = 1.0;
-//     let decay_factor = 0.3;
-//     let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
-//     let mut rng = rand::thread_rng();
-//     rng.gen::<f64>() < probability
-// }
-
-fn should_forward(n_times_received: u64) -> bool {
-    let probability = 1.0 / n_times_received as f64;
+fn should_forward(n_times_receieved: u64) -> bool {
+    let base_probability = 1.0;
+    let decay_factor = 0.9;
+    let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
     let mut rng = rand::thread_rng();
     rng.gen::<f64>() < probability
 }
 
-fn now_unix() -> u64 {
+// fn should_forward(n_times_received: u64) -> bool {
+//     if n_times_received == 0 {
+//         return true;
+//     }
+//     let decay_factor = 0.99; // Adjust this decay factor for a steeper drop
+//     let probability = (1.0 / (n_times_received as f64)).powf(decay_factor);
+//     let mut rng = rand::thread_rng();
+//     rng.gen::<f64>() < probability
+// }
+
+// fn should_forward(n_times_received: u64) -> bool {
+//     let probability = 1.0 / n_times_received as f64;
+//     let mut rng = rand::thread_rng();
+//     rng.gen::<f64>() < probability
+// }
+
+pub fn now_unix() -> u64 {
     return time::SystemTime::now()
         .duration_since(time::UNIX_EPOCH)
         .unwrap()

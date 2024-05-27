@@ -15,10 +15,10 @@ fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let number_nodes = 20;
-    let heartbeat_interval_secs = 30;
+    let number_nodes = 50;
+    let heartbeat_interval_secs = 10;
     let poll_interval_milisecs = 10;
-    let heartbeat_spread = 3;
+    let heartbeat_spread = 5;
 
     let seed_nodes = vec![
         ("1".to_string(), "0.0.0.0:8001".to_string()),
@@ -51,7 +51,7 @@ fn main() {
         });
     }
 
-    let PLOT = false;
+    let PLOT = true;
     if PLOT {
         plot(&all_shared_storages, number_nodes);
     }
@@ -108,7 +108,7 @@ fn plot(all_shared_storages: &HashMap<String, Arc<Mutex<gossip::Storage>>>, numb
                 .lineplot(&Shape::Lines(&messages_sent))
                 .display();
 
-            sleep(time::Duration::from_millis(200));
+            sleep(time::Duration::from_millis(1000));
             i += 1;
         }
     });
@@ -117,20 +117,21 @@ fn plot(all_shared_storages: &HashMap<String, Arc<Mutex<gossip::Storage>>>, numb
 fn calculate_metrics(
     all_shared_storages: &HashMap<String, Arc<Mutex<gossip::Storage>>>,
     number_nodes: u64,
+    healthy_threshold_secs: u64,
 ) -> (f32, f32, f32) {
     // first we collect the last hearbeat sent from each node
-    let mut latest_timestamps = HashMap::new();
-    for (node_id, shared_storage) in all_shared_storages {
-        let storage = match shared_storage.lock() {
-            Ok(guard) => guard,
-            Err(PoisonError { .. }) => {
-                error!("failed to lock shared storage");
-                continue;
-            }
-        };
-        let heartbeat_data = storage.data.get(node_id).unwrap();
-        latest_timestamps.insert(node_id.clone(), heartbeat_data.heartbeat.timestamp);
-    }
+    // let mut latest_timestamps = HashMap::new();
+    // for (node_id, shared_storage) in all_shared_storages {
+    //     let storage = match shared_storage.lock() {
+    //         Ok(guard) => guard,
+    //         Err(PoisonError { .. }) => {
+    //             error!("failed to lock shared storage");
+    //             continue;
+    //         }
+    //     };
+    //     let heartbeat_data = storage.data.get(node_id).unwrap();
+    //     latest_timestamps.insert(node_id.clone(), heartbeat_data.heartbeat.timestamp);
+    // }
 
     // then check to see if each node has the latest info about each other node
     let mut n_messages_sent = 0;
@@ -145,30 +146,56 @@ fn calculate_metrics(
             }
         };
 
-        if storage.data.len() == number_nodes as usize {
+        // dbg!(
+        //     storage.data.len() == number_nodes as usize,
+        //     storage.data.len(),
+        //     number_nodes
+        // );
+        // dbg!(storage.data.keys());
+        if storage.data.len() >= number_nodes as usize {
             n_know_all += 1;
         }
 
         let mut nr_with_latest = 0;
         for (node_id, data) in &storage.data {
-            let last_heartbeat_timestamp = match latest_timestamps.get(node_id) {
-                Some(ts) => ts,
-                None => continue,
-            };
+            // let last_heartbeat_timestamp = match latest_timestamps.get(node_id) {
+            //     Some(ts) => ts,
+            //     None => continue,
+            // };
 
             n_messages_sent += data.received_count;
 
-            if last_heartbeat_timestamp == &data.heartbeat.timestamp {
+            // dbg!(
+            //     gossip::now_unix() - data.heartbeat.timestamp.clone() < 60,
+            //     gossip::now_unix() - data.heartbeat.timestamp.clone()
+            // );
+            if (gossip::now_unix() - data.heartbeat.timestamp.clone() < healthy_threshold_secs) {
                 nr_with_latest += 1
             }
+
+            // dbg!(
+            //     last_heartbeat_timestamp == &data.heartbeat.timestamp,
+            //     last_heartbeat_timestamp,
+            //     &data.heartbeat.timestamp
+            // );
+            // if last_heartbeat_timestamp == &data.heartbeat.timestamp {
+            //     nr_with_latest += 1
+            // }
         }
 
+        // dbg!(nr_with_latest != number_nodes, nr_with_latest, number_nodes);
         if nr_with_latest != number_nodes {
             continue;
         }
 
         n_fully_informed += 1
     }
+
+    dbg!(
+        n_fully_informed as f32,
+        n_know_all as f32,
+        n_messages_sent as f32,
+    );
 
     return (
         n_fully_informed as f32,

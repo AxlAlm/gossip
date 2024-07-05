@@ -4,13 +4,12 @@ use core::time;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, sleep, JoinHandle};
-use textplots::{ColorPlot, Plot, Shape};
+use textplots::{ColorPlot, Shape};
 use tracing::error;
-use tracing_subscriber::reload::Handle;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 const HEALTHY_THRESHOLD_SECS: u64 = 60;
-const NUMBER_NODES: u64 = 50;
+const NUMBER_NODES: u64 = 100;
 const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 const POLL_INTERVAL_MILISECS: u64 = 15;
 const HEARTBEAT_SPREAD: usize = 5;
@@ -100,7 +99,6 @@ fn plot(
     healthy_threshold_secs: u64,
 ) {
     const PURPLE: rgb::RGB8 = rgb::RGB8::new(0xE0, 0x80, 0xFF);
-    // const RED: rgb::RGB8 = rgb::RGB8::new(0xFF, 0x00, 0x00);
     const GREEN: rgb::RGB8 = rgb::RGB8::new(0x00, 0xFF, 0x00);
 
     let term = console::Term::stdout();
@@ -131,13 +129,15 @@ fn plot(
             }
 
             term.move_cursor_to(0, 0).unwrap();
-            textplots::Chart::new_with_y_range(100, 50, 0.0, i as f32, 0.0, number_nodes as f32)
-                .linecolorplot(&Shape::Lines(&fully_informed), PURPLE)
-                .linecolorplot(&Shape::Lines(&know_all), GREEN)
+            println!("Number Fully Informed Nodes");
+            textplots::Chart::new_with_y_range(200, 50, 0.0, i as f32, 0.0, number_nodes as f32)
+                .linecolorplot(&Shape::Lines(&fully_informed), GREEN)
+                // .linecolorplot(&Shape::Lines(&know_all), GREEN)
                 .display();
 
-            textplots::Chart::new_with_y_range(100, 50, 0.0, i as f32, 0.0, max_n_messages_sent)
-                .lineplot(&Shape::Lines(&messages_sent))
+            println!("Number Message");
+            textplots::Chart::new_with_y_range(200, 50, 0.0, i as f32, 0.0, max_n_messages_sent)
+                .linecolorplot(&Shape::Lines(&messages_sent), PURPLE)
                 .display();
 
             sleep(time::Duration::from_millis(1000));

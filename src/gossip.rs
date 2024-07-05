@@ -413,7 +413,7 @@ fn select_random_n_strings(a: Vec<String>, n: usize) -> Vec<String> {
 
 fn should_forward(n_times_receieved: u64) -> bool {
     let base_probability = 1.0;
-    let decay_factor = 0.9;
+    let decay_factor = 0.8;
     let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
     let mut rng = rand::thread_rng();
     rng.gen::<f64>() < probability

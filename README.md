@@ -45,6 +45,7 @@ cargo run
 
 - when selecting which nodes to forward information to the selection of nodes could be weighted based on how many times they have been send the information before
 - suspecting that the implementation is way to chatty, around 30k message are sent to inform 100 nodes which seems alot. Either more tuning of configuration needs to be done, or the implementation is too naive to be able to reduce "chattyness".
+- would be nice to be able to handle simulation with 1000 nodes, but then i would need to give up using std:Threads and move to rayon or tokio, but then nodes are not truely parallel.
 
 ## General Insights
 

@@ -2,7 +2,7 @@
 
 This project simulates a gossip protocol in a distributed system. It includes functionality to monitor the health and information dissemination among nodes in the network.
 
-## Features
+### Features
 
 - **Node Initialization**: Start a specified number of nodes, each with its own storage and communication channels.
 - **Gossip Protocol**: Nodes periodically exchange information about each other's states.
@@ -12,16 +12,14 @@ This project simulates a gossip protocol in a distributed system. It includes fu
 
 ## Problem
 
-We have a distributed system of nodes, and we need to efficiently track the health and status of all nodes in the network.
+We have a distributed system of nodes, and we need to track the health and status of all nodes in the network.
 
-## Solution:
+## Solution
 
-We use a gossip protocol to disseminate heartbeat messages in an epidemic fashion, ensuring tracking of the health and status of all nodes in the distributed system.
-
-The implemented gossip protocol is an epidemic variant that relies on broadcasting multiple messages to ensure redundancy. Nodes periodically send and receive heartbeat messages to track each other's status. To enhance reliability, nodes also forward previously seen messages, ensuring that information propagates throughout the network and reaches all nodes.
+We use a epidemic gossip protocol to disseminate heartbeats from nodes to all nodes, making each node aware of the health of each other node.
 
 1. **Heartbeat Transmission**: Every `N` seconds, each node sends a heartbeat to `N` random nodes.
-2. **Probabilistic Forwarding**: Upon receiving a heartbeat, a node forwards it to `N` random nodes with a probability that decreases based on the number of times the heartbeat has been received previously.
+2. **Probabilistic Forwarding**: Upon receiving a heartbeat, a node forwards it to `N` random nodes with a probability that decreases based on the number of times the heartbeat has been received previously. This means that we pass on "seen" information with some degree of redundancy which ensures all information reaches all nodes.
 
 ## Simulation (with base settings)
 
@@ -46,6 +44,7 @@ cargo run
 ## Possible improvements
 
 - when selecting which nodes to forward information to the selection of nodes could be weighted based on how many times they have been send the information before
+- suspecting that the implementation is way to chatty, around 30k message are sent to inform 100 nodes which seems alot. Either more tuning of configuration needs to be done, or the implementation is too naive to be able to reduce "chattyness".
 
 ## General Insights
 

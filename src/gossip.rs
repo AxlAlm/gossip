@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use serde_json::Error as SerdeError;
 use std::collections::HashMap;
-use std::fmt;
 use std::io::{self};
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use std::{f64, fmt};
 use std::{thread, time};
 use tracing::{error, info, span, Level};
 
@@ -20,6 +21,8 @@ pub struct Node {
     heartbeat_interval_secs: u64,
     heartbeat_spread: usize,
     poll_interval_milisecs: u64,
+    decay_factor: f64,
+    is_alive: Arc<AtomicBool>,
 }
 
 impl Node {
@@ -30,6 +33,8 @@ impl Node {
         heartbeat_interval_secs: u64,
         heartbeat_spread: usize,
         poll_interval_milisecs: u64,
+        decay_factor: f64,
+        is_alive: Arc<AtomicBool>,
     ) -> Self {
         let socket = UdpSocket::bind(&address).expect("Could not bind socket");
         socket
@@ -45,6 +50,8 @@ impl Node {
             heartbeat_interval_secs,
             heartbeat_spread,
             poll_interval_milisecs,
+            decay_factor,
+            is_alive,
         }
     }
 
@@ -62,12 +69,14 @@ impl Node {
         let poll_interval_milisecs = self.poll_interval_milisecs;
         let heartbeat_interval_secs = self.heartbeat_interval_secs;
         let heartbeat_spread = self.heartbeat_spread;
+        let decay_factor = self.decay_factor;
         let id = self.id.clone();
         let address = self.address.clone();
         let shared_storage = self.shared_storage.clone();
         let shared_channel = self.shared_channel.clone();
         let shared_storage_clone = shared_storage.clone();
         let shared_channel_clone = shared_channel.clone();
+        let shared_is_alive = self.is_alive.clone();
 
         let span_clone = node_span.clone();
         let _ = thread::spawn(move || {
@@ -79,11 +88,13 @@ impl Node {
                 heartbeat_spread,
                 shared_storage_clone,
                 shared_channel_clone,
+                shared_is_alive,
             )
         });
 
         let shared_storage_clone = shared_storage.clone();
         let shared_channel_clone = shared_channel.clone();
+        let is_alive = self.is_alive.clone();
         let address = self.address.clone();
         let span_clone = node_span.clone();
         let _ = thread::spawn(move || {
@@ -92,8 +103,10 @@ impl Node {
                 address,
                 poll_interval_milisecs,
                 heartbeat_spread,
+                decay_factor,
                 shared_storage_clone,
                 shared_channel_clone,
+                is_alive,
             )
         });
 
@@ -108,8 +121,14 @@ fn periodic_heartbeat(
     heartbeat_spread: usize,
     shared_storage: Arc<Mutex<Storage>>,
     shared_channel: Arc<Mutex<UdapChannel>>,
+    is_alive: Arc<AtomicBool>,
 ) {
     loop {
+        if !is_alive.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
         let heartbeat = Heartbeat {
             id: node_id.clone(),
             address: address.clone(),
@@ -183,10 +202,17 @@ fn gossip(
     address: String,
     poll_interval_milisecs: u64,
     heartbeat_spread: usize,
+    decay_factor: f64,
     shared_storage: Arc<Mutex<Storage>>,
     shared_channel: Arc<Mutex<UdapChannel>>,
+    is_alive: Arc<AtomicBool>,
 ) {
     loop {
+        if !is_alive.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
         thread::sleep(Duration::from_millis(poll_interval_milisecs));
 
         let heartbeat: Heartbeat;
@@ -227,7 +253,7 @@ fn gossip(
             };
         }
 
-        if !should_forward(n_times_received) {
+        if !should_forward(n_times_received, decay_factor) {
             continue;
         }
 
@@ -411,29 +437,12 @@ fn select_random_n_strings(a: Vec<String>, n: usize) -> Vec<String> {
     a[..n].to_vec()
 }
 
-fn should_forward(n_times_receieved: u64) -> bool {
+fn should_forward(n_times_receieved: u64, decay_factor: f64) -> bool {
     let base_probability = 1.0;
-    let decay_factor = 0.8;
     let probability = base_probability * f64::exp(-decay_factor * n_times_receieved as f64);
     let mut rng = rand::thread_rng();
     rng.gen::<f64>() < probability
 }
-
-// fn should_forward(n_times_received: u64) -> bool {
-//     if n_times_received == 0 {
-//         return true;
-//     }
-//     let decay_factor = 0.99; // Adjust this decay factor for a steeper drop
-//     let probability = (1.0 / (n_times_received as f64)).powf(decay_factor);
-//     let mut rng = rand::thread_rng();
-//     rng.gen::<f64>() < probability
-// }
-
-// fn should_forward(n_times_received: u64) -> bool {
-//     let probability = 1.0 / n_times_received as f64;
-//     let mut rng = rand::thread_rng();
-//     rng.gen::<f64>() < probability
-// }
 
 pub fn now_unix() -> u64 {
     return time::SystemTime::now()
